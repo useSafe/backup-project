@@ -1,0 +1,809 @@
+import { Cabinet, Shelf, Folder, Box, Division, Procurement, User, LocationStats } from '@/types/procurement';
+import { Supplier } from '@/types/supplier';
+import { db } from './firebase';
+import { ref, get, set, remove, push, child, onValue, update } from 'firebase/database';
+import { logActivity } from './activity-logger';
+
+// ========== User Storage ==========
+// We'll keep user storage local for now as it's just a simple simulation
+// In a real app, this would use Firebase Auth
+export const getStoredUser = (): User | null => {
+    const data = localStorage.getItem('filetracker_user');
+    return data ? JSON.parse(data) : null;
+};
+
+export const setStoredUser = (user: User | null): void => {
+    if (user) {
+        // Security: Do not store password or role in local storage
+        const { password, role, ...safeUser } = user;
+        localStorage.setItem('filetracker_user', JSON.stringify(safeUser));
+    } else {
+        localStorage.removeItem('filetracker_user');
+    }
+};
+
+// ========== Realtime Subscriptions ==========
+// These helpers allow components to subscribe to data changes
+
+export const onCabinetsChange = (callback: (cabinets: Cabinet[]) => void) => {
+    const cabinetsRef = ref(db, 'cabinets');
+    return onValue(cabinetsRef, (snapshot) => {
+        const data = snapshot.val();
+        const cabinets = data ? Object.values(data) as Cabinet[] : [];
+        callback(cabinets);
+    });
+};
+
+export const onShelvesChange = (callback: (shelves: Shelf[]) => void) => {
+    const shelvesRef = ref(db, 'shelves');
+    return onValue(shelvesRef, (snapshot) => {
+        const data = snapshot.val();
+        const shelves = data ? Object.values(data) as Shelf[] : [];
+        callback(shelves);
+    });
+};
+
+export const onFoldersChange = (callback: (folders: Folder[]) => void) => {
+    const foldersRef = ref(db, 'folders');
+    return onValue(foldersRef, (snapshot) => {
+        const data = snapshot.val();
+        const folders = data ? Object.values(data) as Folder[] : [];
+        callback(folders);
+    });
+};
+
+export const onProcurementsChange = (callback: (procurements: Procurement[]) => void) => {
+    const procurementsRef = ref(db, 'procurements');
+    return onValue(procurementsRef, (snapshot) => {
+        const data = snapshot.val();
+        const procurements = data ? Object.values(data) as Procurement[] : [];
+
+        let needsDbSync = false;
+
+        procurements.forEach(p => {
+            if (p.supplier) {
+                // Determine if it matches typical base64 pattern and does not contain spaces
+                if (/^[A-Za-z0-9+/=]{8,}$/.test(p.supplier) && !p.supplier.includes(' ')) {
+                    try {
+                        let decoded = atob(p.supplier);
+                        try {
+                            decoded = decodeURIComponent(escape(decoded));
+                        } catch (e) {
+                            // ignore URI malform
+                        }
+                        // Verify if the result looks like a readable human string (ASCII bounds check)
+                        if (/^[\x20-\x7E]+$/.test(decoded)) {
+                            p.supplier = decoded;
+                            // Silently sync the fix back to the database
+                            update(ref(db, `procurements/${p.id}`), { supplier: decoded });
+                        }
+                    } catch (e) {
+                        // Not base64
+                    }
+                }
+            }
+        });
+
+        callback(procurements);
+    });
+};
+
+export const onBoxesChange = (callback: (boxes: Box[]) => void) => {
+    const boxesRef = ref(db, 'boxes');
+    return onValue(boxesRef, (snapshot) => {
+        const data = snapshot.val();
+        const boxes = data ? Object.values(data) as Box[] : [];
+        callback(boxes);
+    });
+};
+
+export const onDivisionsChange = (callback: (divisions: Division[]) => void) => {
+    const divisionsRef = ref(db, 'divisions');
+    return onValue(divisionsRef, (snapshot) => {
+        const data = snapshot.val();
+        const divisions = data ? Object.values(data) as Division[] : [];
+        callback(divisions);
+    });
+};
+
+export const onSuppliersChange = (callback: (suppliers: Supplier[]) => void) => {
+    const suppliersRef = ref(db, 'suppliers');
+    return onValue(suppliersRef, (snapshot) => {
+        const data = snapshot.val();
+        const suppliers = data ? Object.values(data) as Supplier[] : [];
+        callback(suppliers);
+    });
+};
+
+// ========== FETCH (Promise-based for one-time reads) ==========
+
+export const getCabinets = async (): Promise<Cabinet[]> => {
+    const dbRef = ref(db);
+    const snapshot = await get(child(dbRef, 'cabinets'));
+    if (snapshot.exists()) {
+        return Object.values(snapshot.val()) as Cabinet[];
+    }
+    return [];
+};
+
+export const getShelves = async (): Promise<Shelf[]> => {
+    const dbRef = ref(db);
+    const snapshot = await get(child(dbRef, 'shelves'));
+    if (snapshot.exists()) {
+        return Object.values(snapshot.val()) as Shelf[];
+    }
+    return [];
+};
+
+export const getFolders = async (): Promise<Folder[]> => {
+    const dbRef = ref(db);
+    const snapshot = await get(child(dbRef, 'folders'));
+    if (snapshot.exists()) {
+        return Object.values(snapshot.val()) as Folder[];
+    }
+    return [];
+};
+
+export const getProcurements = async (): Promise<Procurement[]> => {
+    const dbRef = ref(db);
+    const snapshot = await get(child(dbRef, 'procurements'));
+    if (snapshot.exists()) {
+        return Object.values(snapshot.val()) as Procurement[];
+    }
+    return [];
+};
+
+export const getBoxes = async (): Promise<Box[]> => {
+    const dbRef = ref(db);
+    const snapshot = await get(child(dbRef, 'boxes'));
+    if (snapshot.exists()) {
+        return Object.values(snapshot.val()) as Box[];
+    }
+    return [];
+};
+
+export const getSuppliers = async (): Promise<Supplier[]> => {
+    const dbRef = ref(db);
+    const snapshot = await get(child(dbRef, 'suppliers'));
+    if (snapshot.exists()) {
+        return Object.values(snapshot.val()) as Supplier[];
+    }
+    return [];
+};
+
+// ========== WRITE OPERATIONS ==========
+
+// --- Cabinet ---
+export const addCabinet = async (name: string, code: string, description?: string): Promise<Cabinet> => {
+    const id = crypto.randomUUID();
+    const newCabinet: Cabinet = {
+        id,
+        name: name.trim(),
+        code: code.trim().toUpperCase(),
+        description: description?.trim(),
+        createdAt: new Date().toISOString(),
+    };
+    await set(ref(db, 'cabinets/' + id), newCabinet);
+    logActivity('add', 'cabinet', `${newCabinet.name} (${newCabinet.code})`, 'system', 'system');
+    return newCabinet;
+};
+
+export const updateCabinet = async (id: string, updates: Partial<Cabinet>): Promise<void> => {
+    await update(ref(db, 'cabinets/' + id), updates);
+    logActivity('edit', 'cabinet', updates.name || id, 'system', 'system');
+};
+
+export const deleteCabinet = async (id: string): Promise<void> => {
+    // Check for procurements
+    const procurements = await getProcurements();
+    const hasFiles = procurements.some(p => p.cabinetId === id);
+    if (hasFiles) {
+        throw new Error("Cannot delete Cabinet: It contains active records. Please move or delete them first.");
+    }
+
+    // Also delete all shelves and folders in this cabinet
+    // Note: In a real backend this should be a transaction or cloud function.
+    // Client-side cascading delete is risky but sufficient for this demo.
+
+    // 1. Get Shelves to delete
+    const shelves = await getShelves();
+    const cabinetShelves = shelves.filter(s => s.cabinetId === id);
+
+    // 2. Delete Shelves (which will delete folders)
+    for (const shelf of cabinetShelves) {
+        await deleteShelf(shelf.id);
+    }
+
+    // 3. Delete Cabinet
+    await remove(ref(db, 'cabinets/' + id));
+    logActivity('delete', 'cabinet', id, 'system', 'system');
+};
+
+// --- Shelf ---
+export const addShelf = async (cabinetId: string, name: string, code: string, description?: string): Promise<Shelf> => {
+    const id = crypto.randomUUID();
+    const newShelf: Shelf = {
+        id,
+        cabinetId,
+        name: name.trim(),
+        code: code.trim().toUpperCase(),
+        description: description?.trim(),
+        createdAt: new Date().toISOString(),
+    };
+    await set(ref(db, 'shelves/' + id), newShelf);
+    logActivity('add', 'drawer', `${newShelf.name} (${newShelf.code})`, 'system', 'system');
+    return newShelf;
+};
+
+export const updateShelf = async (id: string, updates: Partial<Shelf>): Promise<void> => {
+    await update(ref(db, 'shelves/' + id), updates);
+};
+
+export const deleteShelf = async (id: string): Promise<void> => {
+    // Check for procurements
+    const procurements = await getProcurements();
+    const hasFiles = procurements.some(p => p.shelfId === id);
+    if (hasFiles) {
+        throw new Error("Cannot delete Shelf: It contains active records. Please move or delete them first.");
+    }
+
+    // 1. Get Folders
+    const folders = await getFolders();
+    const shelfFolders = folders.filter(f => f.shelfId === id);
+
+    // 2. Delete Folders
+    for (const folder of shelfFolders) {
+        await deleteFolder(folder.id);
+    }
+
+    // 3. Delete Shelf
+    await remove(ref(db, 'shelves/' + id));
+    logActivity('delete', 'drawer', id, 'system', 'system');
+};
+
+// --- Folder ---
+export const addFolder = async (
+    parentId: string, // shelfId OR boxId
+    name: string,
+    code: string,
+    description?: string,
+    color?: string,
+    parentType: 'shelf' | 'box' = 'shelf'
+): Promise<Folder> => {
+    const id = crypto.randomUUID();
+    // Calculate Stack Number
+    const allFolders = await getFolders();
+    const siblingFolders = allFolders.filter(f => {
+        if (parentType === 'shelf') return f.shelfId === parentId;
+        return f.boxId === parentId;
+    });
+    const maxStack = Math.max(...siblingFolders.map(f => f.stackNumber || 0), 0);
+    const newStackNumber = maxStack + 1;
+
+    const newFolder: any = {
+        id,
+        name: name.trim(),
+        code: code.trim().toUpperCase(),
+        description: description?.trim() || '',
+        color: color || '#FF6B6B',
+        createdAt: new Date().toISOString(),
+        stackNumber: newStackNumber
+    };
+
+    if (parentType === 'shelf') {
+        newFolder.shelfId = parentId;
+    } else {
+        newFolder.boxId = parentId;
+    }
+
+    await set(ref(db, 'folders/' + id), newFolder);
+    logActivity('add', 'folder', `${newFolder.name} (${newFolder.code})`, 'system', 'system');
+    return newFolder;
+};
+
+export const updateFolder = async (id: string, updates: Partial<Folder>): Promise<void> => {
+    if ('boxId' in updates || 'shelfId' in updates) {
+        const folders = await getFolders();
+        const currentFolder = folders.find(f => f.id === id);
+
+        if (currentFolder) {
+            // Determine if parent actually changed
+            const isBoxChanged = 'boxId' in updates && updates.boxId !== currentFolder.boxId;
+            const isShelfChanged = 'shelfId' in updates && updates.shelfId !== currentFolder.shelfId;
+
+            if (isBoxChanged || isShelfChanged) {
+                const procurements = await getProcurements();
+                const folderRecords = procurements.filter(p => p.folderId === id);
+
+                const dbUpdates: Record<string, any> = {};
+
+                // Add folder updates
+                Object.keys(updates).forEach(key => {
+                    dbUpdates[`folders/${id}/${key}`] = updates[key as keyof Folder];
+                });
+
+                // Calculate the new locations
+                const targetBoxId = 'boxId' in updates ? updates.boxId : currentFolder.boxId;
+                const targetShelfId = 'shelfId' in updates ? updates.shelfId : currentFolder.shelfId;
+                let targetCabinetId: string | null = null;
+
+                if (targetShelfId && !targetBoxId) {
+                    const shelves = await getShelves();
+                    const targetShelf = shelves.find(s => s.id === targetShelfId);
+                    if (targetShelf) {
+                        targetCabinetId = targetShelf.cabinetId;
+                    }
+                }
+
+                // Append all child procurements updates
+                for (const record of folderRecords) {
+                    dbUpdates[`procurements/${record.id}/boxId`] = targetBoxId || null;
+                    dbUpdates[`procurements/${record.id}/shelfId`] = targetShelfId || null;
+                    dbUpdates[`procurements/${record.id}/cabinetId`] = targetCabinetId || null;
+                }
+
+                await update(ref(db), dbUpdates);
+                logActivity('edit', 'folder', updates.name || id, 'system', 'system');
+                return;
+            }
+        }
+    }
+
+    await update(ref(db, 'folders/' + id), updates);
+    logActivity('edit', 'folder', updates.name || id, 'system', 'system');
+};
+
+export const deleteFolder = async (id: string): Promise<void> => {
+    // Check for procurements
+    const procurements = await getProcurements();
+    const hasFiles = procurements.some(p => p.folderId === id);
+    if (hasFiles) {
+        throw new Error("Cannot delete Folder: It contains active records. Please move or delete them first.");
+    }
+    await remove(ref(db, 'folders/' + id));
+    logActivity('delete', 'folder', id, 'system', 'system');
+};
+
+// --- Box ---
+export const addBox = async (
+    boxData: { name: string; code: string; description?: string; cabinetId?: string; shelfId?: string }
+): Promise<Box> => {
+    const id = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    const newBox: any = {
+        id,
+        name: boxData.name,
+        code: boxData.code,
+        description: boxData.description || '',
+        createdAt: now
+    };
+
+    if (boxData.cabinetId) newBox.cabinetId = boxData.cabinetId;
+    if (boxData.shelfId) newBox.shelfId = boxData.shelfId;
+
+    await set(ref(db, 'boxes/' + id), newBox);
+    logActivity('add', 'box', `${newBox.name} (${newBox.code})`, 'system', 'system');
+    return newBox;
+};
+
+export const updateBox = async (id: string, updates: Partial<Box>): Promise<void> => {
+    await update(ref(db, `boxes/${id}`), updates);
+};
+
+export const deleteBox = async (id: string): Promise<void> => {
+    // Check for procurements directly in box (legacy support or if we allow direct files)
+    // AND check for folders in box
+    const procurements = await getProcurements();
+    const folders = await getFolders();
+
+    const hasFiles = procurements.some(p => p.boxId === id);
+    const hasFolders = folders.some(f => f.boxId === id);
+
+    if (hasFiles) {
+        throw new Error("Cannot delete Box: It contains active records. Please move or delete them first.");
+    }
+
+    // Allow deleting if only empty folders? Or cascade delete folders?
+    // User expectation for "Cabinets" was cascading. Let's do cascading for Box->Folder too.
+    const boxFolders = folders.filter(f => f.boxId === id);
+
+    // Check if any of these folders have files
+    for (const folder of boxFolders) {
+        const folderHasFiles = procurements.some(p => p.folderId === folder.id);
+        if (folderHasFiles) {
+            throw new Error(`Cannot delete Box: Folder '${folder.name}' contains records. Please emtpy it first.`);
+        }
+    }
+
+    // Delete folders
+    for (const folder of boxFolders) {
+        await deleteFolder(folder.id);
+    }
+
+    await remove(ref(db, 'boxes/' + id));
+    logActivity('delete', 'box', id, 'system', 'system');
+};
+
+// --- Division ---
+export const addDivision = async (name: string, abbreviation: string, endUser?: string): Promise<Division> => {
+    const id = crypto.randomUUID();
+    const newDivision: Division = {
+        id,
+        name: name.trim(),
+        abbreviation: abbreviation.trim().toUpperCase(),
+        endUser: endUser?.trim(),
+        createdAt: new Date().toISOString(),
+    };
+    await set(ref(db, 'divisions/' + id), newDivision);
+    logActivity('add', 'division', `${newDivision.name} (${newDivision.abbreviation})`, 'system', 'system');
+    return newDivision;
+};
+
+export const updateDivision = async (id: string, updates: Partial<Division>): Promise<void> => {
+    await update(ref(db, 'divisions/' + id), updates);
+};
+
+export const deleteDivision = async (id: string): Promise<void> => {
+    await remove(ref(db, 'divisions/' + id));
+    logActivity('delete', 'division', id, 'system', 'system');
+};
+
+// --- Supplier ---
+export const addSupplier = async (supplierData: Omit<Supplier, 'id' | 'createdAt' | 'updatedAt'>): Promise<Supplier> => {
+    const id = crypto.randomUUID();
+    const newSupplier: Supplier = {
+        ...supplierData,
+        id,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+    };
+    await set(ref(db, 'suppliers/' + id), newSupplier);
+    logActivity('add', 'supplier', newSupplier.name, 'system', 'system');
+    return newSupplier;
+};
+
+export const updateSupplier = async (id: string, updates: Partial<Supplier>): Promise<void> => {
+    const updatedData = { ...updates, updatedAt: new Date().toISOString() };
+    await update(ref(db, 'suppliers/' + id), updatedData);
+    logActivity('edit', 'supplier', updates.name || id, 'system', 'system');
+};
+
+export const deleteSupplier = async (id: string): Promise<void> => {
+    const procurements = await getProcurements();
+    // Assuming supplier name is stored in procurement.supplier or we check by ID if ever linked structurally
+    // For now we just let them delete, or track if they are in use:
+    // const hasFiles = procurements.some(p => p.supplier === id || p.supplier === name);
+    await remove(ref(db, 'suppliers/' + id));
+    logActivity('delete', 'supplier', id, 'system', 'system');
+};
+
+// --- Stack Number Logic ---
+
+const recalculateStackNumbers = async (folderId?: string, boxId?: string): Promise<void> => {
+    if (!folderId && !boxId) return;
+
+    // Get all procurements
+    const allProcurements = await getProcurements();
+
+    // Filter by container (Folder OR Box)
+    let containerProcurements: Procurement[] = [];
+    if (folderId) {
+        containerProcurements = allProcurements.filter(p => p.folderId === folderId);
+    } else if (boxId) {
+        // Only get loose files in the box (not in any folder)
+        containerProcurements = allProcurements.filter(p => p.boxId === boxId && !p.folderId);
+    }
+
+    // Filter for those that are "In Stack" (Archived/Available)
+    // Borrowed files (Active) are NOT in the physical stack ordering
+    const stackFiles = containerProcurements
+        .filter(p => p.status === 'archived')
+        .sort((a, b) => {
+            // Sort by stackOrderDate if available, else dateAdded
+            const dateA = a.stackOrderDate || new Date(a.dateAdded).getTime();
+            const dateB = b.stackOrderDate || new Date(b.dateAdded).getTime();
+            return dateA - dateB;
+        });
+
+    // Update stack numbers
+    const updates: Record<string, any> = {};
+
+    // 1. Update Stack Files: Assign 1, 2, 3...
+    stackFiles.forEach((p, index) => {
+        const newStackNumber = index + 1;
+        if (p.stackNumber !== newStackNumber) {
+            updates[`procurements/${p.id}/stackNumber`] = newStackNumber;
+        }
+        // Ensure stackOrderDate is set if missing (to preserve order)
+        if (!p.stackOrderDate) {
+            updates[`procurements/${p.id}/stackOrderDate`] = new Date(p.dateAdded).getTime();
+        }
+    });
+
+    // 2. Update Borrowed Files: Remove stack number
+    const borrowedFiles = containerProcurements.filter(p => p.status === 'active');
+    borrowedFiles.forEach(p => {
+        if (p.stackNumber !== undefined && p.stackNumber !== null) {
+            updates[`procurements/${p.id}/stackNumber`] = null;
+        }
+    });
+
+    if (Object.keys(updates).length > 0) {
+        await update(ref(db), updates);
+    }
+};
+
+// --- Procurement ---
+export const addProcurement = async (
+    procurement: Omit<Procurement, 'id' | 'createdAt' | 'updatedAt' | 'createdBy' | 'createdByName'>,
+    userEmail: string,
+    userName: string
+): Promise<Procurement> => {
+    const id = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    // Sanitize the object to remove undefined values
+    const safeProcurement = JSON.parse(JSON.stringify(procurement)); // Simplest way to strip undefined
+
+    const newProcurement: Procurement = {
+        ...safeProcurement,
+        id,
+        createdBy: userEmail,
+        createdByName: userName,
+        createdAt: now,
+        updatedAt: now,
+        procurementStatus: safeProcurement.procurementStatus || 'Not yet Acted',
+        // If adding directly to stack (archived), set stackOrderDate
+        ...(safeProcurement.status === 'archived' ? { stackOrderDate: Date.now() } : {}),
+    };
+
+    await set(ref(db, 'procurements/' + id), newProcurement);
+
+    // Log the add action
+    logActivity('add', 'file', `${newProcurement.prNumber} - ${newProcurement.projectName || newProcurement.description}`, userEmail, userName);
+
+    // Recalculate stack if added to a folder or box
+    if (newProcurement.folderId) {
+        await recalculateStackNumbers(newProcurement.folderId, undefined);
+    } else if (newProcurement.boxId) {
+        await recalculateStackNumbers(undefined, newProcurement.boxId);
+    }
+
+    return newProcurement;
+};
+
+export const updateProcurement = async (
+    id: string,
+    updates: Partial<Procurement>,
+    userEmail?: string,
+    userName?: string
+): Promise<void> => {
+    // Fetch current state to check for status changes
+    // Need to do this to handle stack logic correctly
+    // Optimization: In a real app backend would handle this trigger.
+    const currentProcurementSnapshot = await get(child(ref(db), `procurements/${id}`));
+    const currentProcurement = currentProcurementSnapshot.val() as Procurement;
+
+    // Sanitize updates to remove undefined
+    const safeUpdates = JSON.parse(JSON.stringify(updates));
+
+    const updatePayload: any = {
+        ...safeUpdates,
+        updatedAt: new Date().toISOString()
+    };
+
+    // Logic for Status Change (Borrowed <-> Returned)
+    if (currentProcurement && updates.status && updates.status !== currentProcurement.status) {
+        if (updates.status === 'archived') {
+            // Returning to stack: Add to end of queue
+            updatePayload.stackOrderDate = Date.now();
+        } else {
+            // Borrowing: Removed from stack (handled by recalculate, implies loss of position)
+            updatePayload.stackOrderDate = null;
+        }
+    }
+
+    // Add editor information if user info is provided
+    if (userEmail && userName) {
+        updatePayload.editedBy = userEmail;
+        updatePayload.editedByName = userName;
+        updatePayload.lastEditedAt = new Date().toISOString();
+    }
+
+    await update(ref(db, 'procurements/' + id), updatePayload);
+
+    // Log the edit action
+    if (userEmail && userName) {
+        logActivity('edit', 'file', currentProcurement?.prNumber || id, userEmail, userName);
+    }
+
+    // Trigger recalculation if folder or box involved
+    const folderId = updates.folderId || currentProcurement?.folderId;
+    const boxId = updates.boxId || currentProcurement?.boxId;
+
+    if (folderId) {
+        await recalculateStackNumbers(folderId, undefined);
+        // If moving between folders
+        if (updates.folderId && currentProcurement?.folderId && updates.folderId !== currentProcurement.folderId) {
+            await recalculateStackNumbers(currentProcurement.folderId, undefined);
+        }
+    } else if (boxId) {
+        await recalculateStackNumbers(undefined, boxId);
+        // If moving between boxes
+        if (updates.boxId && currentProcurement?.boxId && updates.boxId !== currentProcurement.boxId) {
+            await recalculateStackNumbers(undefined, currentProcurement.boxId);
+        }
+    }
+};
+
+export const deleteProcurement = async (id: string): Promise<void> => {
+    const currentProcurementSnapshot = await get(child(ref(db), `procurements/${id}`));
+    const currentProcurement = currentProcurementSnapshot.val() as Procurement;
+
+    await remove(ref(db, 'procurements/' + id));
+    logActivity('delete', 'file', currentProcurement?.prNumber || id, 'system', 'system');
+
+    if (currentProcurement?.folderId) {
+        await recalculateStackNumbers(currentProcurement.folderId, undefined);
+    } else if (currentProcurement?.boxId) {
+        await recalculateStackNumbers(undefined, currentProcurement.boxId);
+    }
+};
+
+// ========== Statistics ==========
+export const getLocationStats = async (): Promise<LocationStats[]> => {
+    const cabinets = await getCabinets();
+    const procurements = await getProcurements();
+
+    return cabinets
+        .map(cabinet => ({
+            cabinetId: cabinet.id,
+            cabinetName: cabinet.name,
+            count: procurements.filter(p => p.cabinetId === cabinet.id).length,
+        }))
+        .filter(stat => stat.count > 0)
+        .sort((a, b) => b.count - a.count);
+};
+
+// ========== Helper Functions ==========
+
+/**
+ * Get folder parent container display string
+ * Returns either "D1 → C1" for drawer/cabinet or "B1" for box
+ */
+export const getFolderParentContainer = async (folder: Folder): Promise<string> => {
+    if (folder.boxId) {
+        // Folder is in a Box
+        const boxes = await getBoxes();
+        const box = boxes.find(b => b.id === folder.boxId);
+        return box ? `${box.name} (${box.code})` : 'Unknown Box';
+    } else if (folder.shelfId) {
+        // Folder is in Drawer→Cabinet hierarchy
+        const shelves = await getShelves();
+        const cabinets = await getCabinets();
+        const shelf = shelves.find(s => s.id === folder.shelfId);
+        if (shelf) {
+            const cabinet = cabinets.find(c => c.id === shelf.cabinetId);
+            return cabinet ? `${cabinet.name} (${cabinet.code}) → ${shelf.name} (${shelf.code})` : shelf.name;
+        }
+    }
+
+    return 'No Parent';
+};
+
+/**
+ * Get count of folders inside a box
+ */
+export const getBoxFolderCount = async (boxId: string): Promise<number> => {
+    const allFolders = await getFolders();
+    return allFolders.filter(f => f.boxId === boxId).length;
+};
+
+/**
+ * Get count of files inside a box (across all folders)
+ */
+export const getBoxFileCount = async (boxId: string): Promise<number> => {
+    const allProcurements = await getProcurements();
+    return allProcurements.filter(p => p.boxId === boxId).length;
+};
+
+/**
+ * Get location path string for a procurement
+ * Returns formatted string like "D1 → C1 → F1" or "B1 → F1"
+ */
+export const getLocationPath = async (procurement: Procurement): Promise<string> => {
+    if (procurement.boxId) {
+        // Box hierarchy
+        const boxes = await getBoxes();
+        const folders = await getFolders();
+        const box = boxes.find(b => b.id === procurement.boxId);
+        const folder = folders.find(f => f.id === procurement.folderId);
+
+        if (box && folder) {
+            return `${box.code} → ${folder.code}`;
+        }
+        return box?.code || 'Unknown';
+    } else {
+        // Drawer-Cabinet hierarchy
+        const cabinets = await getCabinets();
+        const shelves = await getShelves();
+        const folders = await getFolders();
+
+        const cabinet = cabinets.find(c => c.id === procurement.cabinetId);
+        const shelf = shelves.find(s => s.id === procurement.shelfId);
+        const folder = folders.find(f => f.id === procurement.folderId);
+
+        let path = cabinet?.code || '?';
+        if (shelf) path += ` → ${shelf.code}`;
+        if (folder) path += ` → ${folder.code}`;
+
+        return path;
+    }
+};
+
+export const recalculateAllFolders = async (): Promise<void> => {
+    const folders = await getFolders();
+    for (const folder of folders) {
+        await recalculateStackNumbers(folder.id, undefined);
+    }
+    console.log(`Recalculated stack numbers for ${folders.length} folders`);
+};
+
+// ========== Initialization ==========
+export const initializeDemoData = (): void => {
+    // Blank initialization as requested
+    console.log("Firebase initialized. No demo data added.");
+};
+
+// ========== User Management ==========
+
+export const onUsersChange = (callback: (users: User[]) => void) => {
+    const usersRef = ref(db, 'users');
+    return onValue(usersRef, (snapshot) => {
+        const data = snapshot.val();
+        const users = data ? Object.values(data) as User[] : [];
+        callback(users);
+    });
+};
+
+export const addUser = async (user: User): Promise<void> => {
+    const userId = user.id || crypto.randomUUID();
+    const newUser = { ...user, id: userId, createdAt: new Date().toISOString() };
+    await set(ref(db, `users/${userId}`), newUser);
+    logActivity('add', 'account', `${newUser.name} (${newUser.email})`, 'system', 'system');
+};
+
+export const updateUser = async (id: string, updates: Partial<User>): Promise<void> => {
+    await update(ref(db, `users/${id}`), updates);
+    logActivity('edit', 'account', updates.name || updates.email || id, 'system', 'system');
+};
+
+export const deleteUser = async (id: string): Promise<void> => {
+    await remove(ref(db, `users/${id}`));
+    logActivity('delete', 'account', id, 'system', 'system');
+};
+
+// ========== Exact Database Size ==========
+// Reads from /stats/dbSize which is written by a Cloud Function (runs every 24h)
+// If no Cloud Function is deployed yet, falls back to a lightweight JSON estimate
+// of just the procurements node to avoid scanning the full DB.
+export const onDatabaseSizeChange = (callback: (bytes: number) => void) => {
+    const statsRef = ref(db, 'stats/dbSize');
+    return onValue(statsRef, (snapshot) => {
+        const data = snapshot.val();
+        if (data && typeof data.bytes === 'number') {
+            // Cloud Function wrote a value – use it
+            callback(data.bytes);
+        } else {
+            // Fallback: lightweight estimate from procurements node only
+            const procRef = ref(db, 'procurements');
+            get(procRef).then((snap) => {
+                const val = snap.val();
+                if (!val) { callback(0); return; }
+                const bytes = new Blob([JSON.stringify(val)]).size;
+                callback(bytes);
+            }).catch(() => callback(0));
+        }
+    });
+};
