@@ -434,12 +434,10 @@ Check out the updated Dashboard visualizations and play around with editing an o
 - Revise System Concept where it is applicable to Other Documents, and Box or Drawer->Cabinet doesnt require Folder rather it is able to add file
 - Revise the In Storage and Borrowed Dropdown Logic since it is not applicable to In Progress Document State
 - make it all ui revised, applicable of switch theme cause some isnt just like on this image
-- make the ai using gemini flash api insert on .env file(AIzaSyCevXR2pry4VKOkj0eSIKMzRH48e7BOu7A) focusing on procurement only and the process flow guide
+- make the ai using gemini flash api insert on .env file focusing on procurement only and the process flow guide
 - make the urgent records data renders into pagination upto 15 records only cause it slows the app on navigating to that page
 
 *User accepted the command `npm install @google/generative-ai`*
-
-*User accepted the command `echo VITE_GEMINI_API_KEY=AIzaSyCevXR2pry4VKOkj0eSIKMzRH48e7BOu7A >> .env`*
 
 *Viewed [UrgentRecords.tsx](file:///c:/Users/DrPsycho/Desktop/Project/Procure-App-main/src/pages/UrgentRecords.tsx) *
 
